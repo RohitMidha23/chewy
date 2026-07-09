@@ -1,0 +1,23 @@
+.build/
+.swiftpm/
+.DS_Store
+.agents/skills/
+.claude/skills/
+.claude/.claude/skills/
+.claude/.claude/worktrees/
+.codex/skills/
+
+# Build output / packaging
+dist/
+
+# Python bytecode (hooks)
+**/__pycache__/
+
+# Autoship loop state
+.autoship/
+
+# Local agent/tool state
+.claude/
+.codex/
+.agents/
+tasks/

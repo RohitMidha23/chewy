@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Chewy — states</title>
+<style>
+  :root {
+    --ink: #070808;
+    --accent: #d97757;   /* Claude crushed-orange */
+    --critical: #f55c45; /* hotter ring for critical */
+    --amber: #fa9e33;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background:
+      radial-gradient(1200px 700px at 50% -10%, #14161c 0%, #0a0b0e 46%, #060708 100%);
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { width: 1040px; margin: 0 auto; padding: 72px 40px 64px; }
+
+  /* ---- header ---- */
+  .head { text-align: center; margin-bottom: 8px; }
+  .brand { display: inline-flex; align-items: center; gap: 16px; }
+  .brand h1 {
+    font-size: 52px; font-weight: 700; letter-spacing: -0.02em;
+    background: linear-gradient(180deg, #fff, #d7d2cd);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .tagline {
+    margin-top: 14px; font-size: 17px; line-height: 1.5;
+    color: rgba(255,255,255,0.62); max-width: 560px;
+    margin-left: auto; margin-right: auto;
+  }
+
+  /* ---- section scaffolding ---- */
+  .section { margin-top: 56px; }
+  .label {
+    font-size: 12px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+    color: rgba(255,255,255,0.38); margin-bottom: 20px; text-align: center;
+  }
+
+  /* ---- mascot state trio ---- */
+  .trio { display: flex; justify-content: center; gap: 22px; }
+  .state {
+    flex: 1; max-width: 300px;
+    background: linear-gradient(180deg, rgba(28,30,36,0.9), rgba(12,13,16,0.92));
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 20px; padding: 30px 20px 22px; text-align: center;
+  }
+  .state .glyph { height: 96px; display: flex; align-items: center; justify-content: center; }
+  .state .name { margin-top: 16px; font-size: 16px; font-weight: 600; }
+  .state .desc { margin-top: 5px; font-size: 12.5px; color: rgba(255,255,255,0.5); line-height: 1.45; }
+  .state.attention .name { color: var(--amber); }
+  .state.critical  .name { color: var(--critical); }
+
+  /* ---- menu-bar row ---- */
+  .menubar { display: flex; align-items: flex-start; justify-content: center; gap: 26px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 10px;
+    background: linear-gradient(180deg, rgba(40,42,48,0.92), rgba(22,23,27,0.95));
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 18px; padding: 9px 18px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .pill-wrap { text-align: center; }
+  .pill-wrap .cap { margin-top: 12px; font-size: 12px; color: rgba(255,255,255,0.45); }
+
+  /* the light native dropdown */
+  .menu {
+    width: 360px; background: #ececec; color: #111; border-radius: 14px;
+    padding: 12px 14px; box-shadow: 0 18px 50px rgba(0,0,0,0.5);
+  }
+  .menu .cat { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; color: #7c7c7c; margin: 8px 2px 6px; }
+  .menu .cat:first-child { margin-top: 2px; }
+  .menu .item { display: flex; align-items: flex-start; gap: 9px; padding: 4px 2px; font-size: 13.5px; line-height: 1.35; }
+  .menu .item .ic { flex: none; width: 16px; text-align: center; color: var(--accent); font-weight: 700; }
+  .menu .item .ic.codex { color: #111; }
+  .menu .rec { color: #555; }
+  .menu .check { margin-left: auto; color: #111; padding-left: 8px; }
+
+  /* ---- island cards ---- */
+  .cards { display: flex; flex-direction: column; gap: 16px; align-items: center; }
+  .card {
+    width: 640px;
+    background: linear-gradient(180deg, rgba(24,25,30,0.92), rgba(9,10,13,0.96));
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 20px; padding: 15px 18px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  .card.attention {
+    border-color: rgba(250,158,51,0.55);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35), 0 0 26px rgba(250,158,51,0.16);
+  }
+  .card.critical {
+    border-color: rgba(245,92,69,0.7);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35), 0 0 30px rgba(245,92,69,0.22);
+  }
+  .card .row { display: flex; align-items: center; gap: 13px; }
+  .card .titles { flex: 1; min-width: 0; }
+  .card .title { font-size: 15px; font-weight: 600; color: rgba(255,255,255,0.94); }
+  .card .sub { font-size: 12px; font-weight: 500; color: rgba(255,255,255,0.6); margin-top: 2px; line-height: 1.35; }
+  .card .accounts {
+    flex: none; display: inline-flex; align-items: center; gap: 6px;
+    background: var(--accent); color: #fff; font-size: 12.5px; font-weight: 600;
+    padding: 7px 14px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.22);
+    box-shadow: 0 4px 10px rgba(217,119,87,0.4);
+  }
+  .card .accounts .chev { font-size: 9px; opacity: 0.9; }
+  .card .foot {
+    display: flex; align-items: flex-start; gap: 8px;
+    margin-top: 12px; font-size: 12px; font-weight: 600; line-height: 1.4;
+  }
+  .card .foot .fi { flex: none; font-weight: 700; }
+  .foot.switch  { color: rgba(255,255,255,0.82); }
+  .foot.switch .fi { color: var(--accent); }
+  .foot.amber    { color: var(--amber); }
+  .foot.amber .fi { color: var(--amber); }
+  .foot.hot      { color: var(--critical); }
+  .foot.hot .fi  { color: var(--critical); }
+
+  .foot-note { text-align: center; margin-top: 40px; font-size: 12.5px; color: rgba(255,255,255,0.32); }
+</style>
+</head>
+<body>
+  <div class="page">
+    <header class="head">
+      <div class="brand">
+        <span id="brandGlyph"></span>
+        <h1>Chewy</h1>
+      </div>
+      <p class="tagline">Your co-pilot for Claude &amp; Codex usage — it watches every account's
+      5-hour window and quietly hands you a fresh one the moment you'd hit a wall.</p>
+    </header>
+
+    <section class="section">
+      <div class="label">The mascot &amp; its moods</div>
+      <div class="trio">
+        <div class="state quiet">
+          <div class="glyph" data-mascot="quiet" data-size="88"></div>
+          <div class="name">All clear</div>
+          <div class="desc">Calm and breathing. You've got headroom.</div>
+        </div>
+        <div class="state attention">
+          <div class="glyph" data-mascot="attention" data-size="88"></div>
+          <div class="name">Running low</div>
+          <div class="desc">Eyes wide, amber halo — you're nearing a limit.</div>
+        </div>
+        <div class="state critical">
+          <div class="glyph" data-mascot="critical" data-size="88"></div>
+          <div class="name">Heads up</div>
+          <div class="desc">Hot red ring — a window is maxed. Time to switch.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="label">In your menu bar</div>
+      <div class="menubar">
+        <div class="pill-wrap">
+          <div class="pill">
+            <span data-mascot="quiet" data-size="26"></span>
+            <span class="dot"></span>
+          </div>
+          <div class="cap">Resting pill at the notch</div>
+        </div>
+        <div class="pill-wrap">
+          <div class="menu">
+            <div class="cat">Claude</div>
+            <div class="item"><span class="ic">✳</span><span>alice@example.com — over limit</span><span class="check">✓</span></div>
+            <div class="item"><span class="ic">✳</span><span>bob@example.com — 62% of 5-hour · resets 1h 10m</span></div>
+            <div class="item"><span class="ic">✳</span><span>casey@example.com — 3% of 5-hour <span class="rec">(recommended)</span></span></div>
+            <div class="cat">Codex</div>
+            <div class="item"><span class="ic codex">◎</span><span>alice@example.com</span><span class="check">✓</span></div>
+          </div>
+          <div class="cap">Per-account usage in the dropdown</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="label">Live notifications</div>
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <p class="foot-note">Everything stays on your machine — no telemetry, no server. Rendered from the app's real design tokens.</p>
+  </div>
+
+<script>
+  const ACCENT = "#d97757", CRITICAL = "#f55c45";
+
+  // Faithful re-creation of the SwiftUI MascotGlyph (26x22 body, capsule eyes).
+  function mascot(state, px, id) {
+    const critical = state === "critical";
+    const active = state !== "quiet";
+    const color = critical ? CRITICAL : ACCENT;
+    const eyeH = active ? 7 : 5;
+    const oy = active ? -1.5 : 0.5;
+    const y = 17 - eyeH / 2 + oy;
+    const ring = active
+      ? `<rect x="3" y="3" width="28" height="28" rx="9" fill="none"
+           stroke="${color}" stroke-opacity="${critical ? 0.7 : 0.5}"
+           stroke-width="${critical ? 2.5 : 2}"/>`
+      : "";
+    const glow = active
+      ? `filter:drop-shadow(0 0 ${critical ? 9 : 7}px ${color}${critical ? "aa" : "88"});`
+      : `filter:drop-shadow(0 2px 4px ${color}55);`;
+    return `<svg viewBox="0 0 34 34" width="${px}" height="${px}" style="${glow}">
+      <defs><linearGradient id="mg${id}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="${color}" stop-opacity="0.97"/>
+        <stop offset="1" stop-color="${color}" stop-opacity="0.80"/>
+      </linearGradient></defs>
+      ${ring}
+      <rect x="4" y="6" width="26" height="22" rx="7" fill="url(#mg${id})"/>
+      <rect x="10" y="${y}" width="4" height="${eyeH}" rx="2" fill="#000" fill-opacity="0.82"/>
+      <rect x="20" y="${y}" width="4" height="${eyeH}" rx="2" fill="#000" fill-opacity="0.82"/>
+    </svg>`;
+  }
+
+  let mid = 0;
+  document.querySelectorAll("[data-mascot]").forEach(el => {
+    el.innerHTML = mascot(el.dataset.mascot, +el.dataset.size, mid++);
+  });
+  document.getElementById("brandGlyph").innerHTML = mascot("quiet", 46, mid++);
+
+  const cards = [
+    { state: "quiet", title: "All clear", sub: "alice@example.com · 42% of 5-hour" },
+    { state: "quiet", title: "All clear", sub: "casey@example.com · 3% of 5-hour",
+      foot: "switch", fi: "⇄",
+      ft: "New sessions now use casey@example.com — the previous account hit its 5-hour limit" },
+    { state: "attention", title: "Running low", sub: "alice@example.com · 88% of 5-hour",
+      foot: "amber", fi: "⚠",
+      ft: "88% of 5-hour limit — switch to bob@example.com (most headroom)" },
+    { state: "critical", title: "Heads up", sub: "dana@example.com · 5-hour limit reached",
+      foot: "hot", fi: "⚠",
+      ft: "5-hour limit reached — on extra usage ($42.00 this cycle). → switch to alice@example.com (likely fresh)" },
+    { state: "critical", title: "Heads up", sub: "alice@example.com · 5-hour limit reached",
+      foot: "switch", fi: "⇄", ft: "All accounts are at their 5-hour limit" },
+    { state: "quiet", title: "Let's get set up", sub: "Add a Claude or Codex account", btn: "Add account" },
+  ];
+
+  document.getElementById("cards").innerHTML = cards.map(c => {
+    const foot = c.foot
+      ? `<div class="foot ${c.foot}"><span class="fi">${c.fi}</span><span>${c.ft}</span></div>` : "";
+    return `<div class="card ${c.state}">
+      <div class="row">
+        <span data-m>${mascot(c.state, 34, mid++)}</span>
+        <div class="titles"><div class="title">${c.title}</div><div class="sub">${c.sub}</div></div>
+        <span class="accounts">${c.btn || "Accounts"} <span class="chev">▾</span></span>
+      </div>${foot}
+    </div>`;
+  }).join("");
+</script>
+</body>
+</html>
