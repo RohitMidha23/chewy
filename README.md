@@ -30,7 +30,18 @@ Everything stays on your machine. Tokens live in your login Keychain; account me
 
 ## Install
 
-Build it yourself (no binaries are distributed):
+### Download (Apple Silicon)
+
+Grab `Chewy.zip` from the [latest release](https://github.com/RohitMidha23/chewy/releases/latest), unzip it, and move `Chewy.app` to `/Applications`. It's ad-hoc signed (not notarized — no Apple Developer account), so macOS quarantines the download; clear it and launch:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Chewy.app
+open /Applications/Chewy.app
+```
+
+It lives in the menu bar — there is no Dock icon.
+
+### Build from source
 
 ```bash
 git clone https://github.com/RohitMidha23/chewy.git
@@ -38,7 +49,7 @@ cd chewy
 ./Tools/build-app.sh
 ```
 
-Then drag `dist/Chewy.app` to `/Applications` and **right-click → Open** the first time (the app is ad-hoc signed, not notarized). It lives in the menu bar — there is no Dock icon.
+Then move `dist/Chewy.app` to `/Applications` and **right-click → Open** the first time.
 
 **Requirements:** macOS 14+ and the Xcode Command Line Tools (Swift 6 toolchain).
 
