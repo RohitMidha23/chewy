@@ -200,6 +200,9 @@ do {
     try checkHealGate()
     try checkPolicySimulation()
     try checkNoDeletedSymbols()
+    try checkIdentityFirstDedupe()
+    try checkSecurityAttributeDates()
+    try checkCodexUsageParsing()
     print("ChewyCoreChecks passed")
 } catch {
     fputs("ChewyCoreChecks failed: \(error)\n", stderr)

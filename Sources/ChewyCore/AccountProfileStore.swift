@@ -111,8 +111,13 @@ public final class AccountProfileStore {
     }
 
     /// Inserts or updates a profile, deduping on identity:
-    /// - Claude: (emailAddress, organizationUuid)
+    /// - Claude: the stable `accountId` (accountUuid) when both sides carry one;
+    ///   otherwise (emailAddress, organizationUuid)
     /// - Codex: (emailAddress, workspaceAccountId)
+    ///
+    /// Two Claude captures with DIFFERENT account ids are different accounts and
+    /// are never merged, even when email/org coincide — merging is how a second
+    /// sign-in used to silently overwrite the first instead of appearing in the list.
     ///
     /// If a matching profile exists, its identity fields and `updatedAt` are refreshed
     /// in place and the updated profile is returned. Otherwise a new profile is appended.
@@ -139,6 +144,13 @@ public final class AccountProfileStore {
             guard existing.tool == tool else { return false }
             switch tool {
             case .claude:
+                // Stable account id decides when both sides have one: equal ids are
+                // the same account (even if the email/org changed); different ids
+                // are different accounts (even when email/org coincide).
+                if let accountId, !accountId.isEmpty,
+                   let existingId = existing.accountId, !existingId.isEmpty {
+                    return existingId == accountId
+                }
                 if let emailAddress, let organizationUuid {
                     return existing.emailAddress == emailAddress
                         && existing.organizationUuid == organizationUuid

@@ -30,6 +30,25 @@ final class OverlayPanelController: NSObject {
                 self?.cancelSelfDismiss()
             }
         }
+        // In-island forms (Add account, Remove account) need keystrokes. The panel is
+        // non-activating, so it can take key status Spotlight-style without dragging
+        // the whole app to the front; hand it back when the form closes.
+        model.onKeyboardNeeded = { [weak self] needed in
+            self?.setKeyboardCapture(needed)
+        }
+    }
+
+    private func setKeyboardCapture(_ needed: Bool) {
+        if needed {
+            show(reason: .user)
+            panel.makeKey()
+        } else if panel.isKeyWindow {
+            // orderOut resigns key (focus returns to the previously key app window);
+            // re-show without taking key so the island stays visible.
+            let wasVisible = panel.isVisible
+            panel.orderOut(nil)
+            if wasVisible { panel.orderFrontRegardless() }
+        }
     }
 
     @objc func toggle() {
@@ -108,7 +127,7 @@ final class OverlayPanelController: NSObject {
     }
 
     private func makePanel() -> NSPanel {
-        let panel = NSPanel(
+        let panel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 184),
             styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
             backing: .buffered,
@@ -121,6 +140,7 @@ final class OverlayPanelController: NSObject {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true // only text entry makes the island key
 
         let root = IslandRootView(model: model) { [weak self] height in
             self?.applyContentHeight(height)
@@ -170,4 +190,11 @@ final class OverlayPanelController: NSObject {
     private var panelWidth: CGFloat {
         IslandTheme.width + IslandTheme.outerPadding * 2
     }
+}
+
+/// A borderless panel refuses key status by default, which is why nothing typed
+/// into an in-island text field ever arrived. Allow it explicitly; the
+/// `.nonactivatingPanel` style keeps the rest of the app in the background.
+private final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }

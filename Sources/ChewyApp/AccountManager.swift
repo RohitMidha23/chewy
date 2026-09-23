@@ -109,6 +109,42 @@ final class AccountManager {
         swapManager.canonicalClaudeIdentity()
     }
 
+    /// The account currently written to the canonical Codex `auth.json`.
+    func canonicalCodexIdentity() -> (email: String?, accountId: String?) {
+        swapManager.canonicalCodexIdentity()
+    }
+
+    /// Credentials to poll Codex usage for a SPECIFIC account: the active account
+    /// reads the canonical `~/.codex/auth.json` (the CLI keeps it fresh); others use
+    /// their vaulted `auth.json`, rejected once the JWT access token has expired (a
+    /// stale token would only produce a 401). Never log the token.
+    func codexUsageCredentials(for profile: AccountProfile, isActive: Bool) -> (token: String, accountId: String)? {
+        guard profile.tool == .codex else { return nil }
+        let data: Data?
+        if isActive {
+            data = try? Data(contentsOf: canonicalPaths.codexAuthFile)
+        } else {
+            data = (try? vault.get(accountId: CredentialSwapManager.accountId(for: profile)))?.blob
+        }
+        guard let data,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = object["tokens"] as? [String: Any],
+              let token = tokens["access_token"] as? String, !token.isEmpty else {
+            return nil
+        }
+        let idToken = tokens["id_token"] as? String
+        guard let accountId = (tokens["account_id"] as? String)
+                ?? idToken.flatMap(JWTPayload.chatgptAccountId(from:)),
+              !accountId.isEmpty else {
+            return nil
+        }
+        if let exp = (JWTPayload.decode(token)?["exp"] as? NSNumber)?.doubleValue,
+           exp < Date().timeIntervalSince1970 + 30 {
+            return nil
+        }
+        return (token, accountId)
+    }
+
     // Cache tokens in memory so usage polling doesn't hit the Keychain every cycle —
     // each Keychain read can trigger an "Always Allow" prompt. Access tokens live ~8h,
     // so a long cache is safe. CRITICAL: we cache FAILURES too (negative cache), so an
@@ -309,7 +345,7 @@ final class AccountManager {
         _ profile: AccountProfile,
         onUpdate: @MainActor @escaping (String) -> Void = { _ in }
     ) async -> String {
-        let message = await addAccount(tool: profile.tool, name: profile.name, onUpdate: onUpdate)
+        let message = await addAccount(tool: profile.tool, name: profile.name, isReconnect: true, onUpdate: onUpdate)
         invalidateTokenCache()
         return message
     }
@@ -361,8 +397,10 @@ final class AccountManager {
             persistActiveAccountIDs()
 
             let label = resolvedEmail(for: profile) ?? profile.name
+            ChewyLog.info("swap: \(profile.tool.rawValue) → \(label) (\(profile.slug)) written to canonical")
             return "Now using \(label). Applies to new sessions."
         } catch {
+            ChewyLog.error("swap to \(profile.slug) failed: \(error.localizedDescription)")
             return error.localizedDescription
         }
     }
@@ -385,6 +423,7 @@ final class AccountManager {
     func addAccount(
         tool: AccountTool,
         name: String,
+        isReconnect: Bool = false,
         onUpdate: @MainActor @escaping (String) -> Void = { _ in }
     ) async -> String {
         invalidateTokenCache()
@@ -400,8 +439,13 @@ final class AccountManager {
             case .claude:
                 stagingHome = try claudeProfiles.createOAuthConfigHome(slug: slug)
             }
-            // Always scrub plaintext staging tokens — on success, timeout, or throw.
-            defer { cleanupStaging(tool: tool, stagingHome: stagingHome) }
+            // A staging home (and its suffixed Keychain item) can survive an earlier
+            // attempt under the same slug. Capture must only ever see what THIS login
+            // writes — a leftover identity file + token pair is how a re-login used to
+            // be captured as the PREVIOUS account before the new sign-in even finished.
+            clearStaleStaging(tool: tool, stagingHome: stagingHome)
+            let loginStartedAt = Date()
+            ChewyLog.info("login: \(tool.rawValue) '\(slug)' started\(isReconnect ? " (reconnect)" : "")")
 
             try launchLogin(tool: tool, slug: slug, stagingHome: stagingHome)
             onUpdate("Complete the \(tool.rawValue.capitalized) login in Terminal…")
@@ -415,17 +459,26 @@ final class AccountManager {
 
             while Date() < deadline {
                 let stateSnapshot = pollState
-                let result = try await Task.detached(priority: .utility) {
-                    try Self.captureIfReady(
-                        tool: tool,
-                        stagingHome: stagingHome,
-                        canonicalPaths: candidatePaths,
-                        state: stateSnapshot
-                    )
-                }.value
+                let result: (capture: Capture?, state: CodexPollState)
+                do {
+                    result = try await Task.detached(priority: .utility) {
+                        try Self.captureIfReady(
+                            tool: tool,
+                            stagingHome: stagingHome,
+                            canonicalPaths: candidatePaths,
+                            state: stateSnapshot,
+                            notBefore: loginStartedAt
+                        )
+                    }.value
+                } catch {
+                    cleanupStaging(tool: tool, stagingHome: stagingHome)
+                    throw error
+                }
                 pollState = result.state
                 if let capture = result.capture {
-                    let profile = try persistCapture(
+                    // Scrub plaintext staging tokens now that the durable vault copy exists.
+                    defer { cleanupStaging(tool: tool, stagingHome: stagingHome) }
+                    let (profile, isNew) = try persistCapture(
                         tool: tool,
                         name: finalName,
                         slug: slug,
@@ -433,13 +486,23 @@ final class AccountManager {
                         capture: capture
                     )
                     let label = capture.email ?? profile.name
-                    return "Added \(label). Select it to switch."
+                    ChewyLog.info("login: '\(slug)' captured \(label) — \(isNew ? "new account" : "existing account updated in place")")
+                    if isReconnect { return "Reconnected \(label)." }
+                    if isNew { return "Added \(label). Select it to switch." }
+                    // The browser signed in as an account that is already in the list
+                    // (claude.ai reuses its current session). Say so instead of
+                    // pretending a new account appeared.
+                    return "\(label) is already added — its sign-in was refreshed. To add a different account, switch accounts on claude.ai in your browser first."
                 }
                 try await Task.sleep(nanoseconds: UInt64(Self.pollInterval * 1_000_000_000))
             }
 
+            // Timed out: leave the staging sign-in in place so "I've finished signing
+            // in" can still capture it (finishPendingLogin scrubs afterwards).
+            ChewyLog.warn("login: '\(slug)' timed out after \(Int(Self.loginPollTimeout))s without a complete sign-in")
             return "Sign-in timed out. Finish login in Terminal, then use \u{201C}I\u{2019}ve finished signing in.\u{201D}"
         } catch {
+            ChewyLog.error("login: \(tool.rawValue) failed: \(error.localizedDescription)")
             return error.localizedDescription
         }
     }
@@ -467,13 +530,14 @@ final class AccountManager {
                     tool: tool,
                     stagingHome: stagingHome,
                     canonicalPaths: candidatePaths,
-                    state: manualState
+                    state: manualState,
+                    notBefore: nil // staging was cleared when this login started
                 )
             }.value
             guard let capture = result.capture else {
                 return "Still can\u{2019}t see a completed login. Finish it in Terminal first."
             }
-            let profile = try persistCapture(
+            let (profile, isNew) = try persistCapture(
                 tool: tool,
                 name: name,
                 slug: slug,
@@ -481,7 +545,10 @@ final class AccountManager {
                 capture: capture
             )
             let label = capture.email ?? profile.name
-            return "Added \(label). Select it to switch."
+            ChewyLog.info("login: '\(slug)' captured \(label) via manual finish — \(isNew ? "new account" : "existing account updated")")
+            return isNew
+                ? "Added \(label). Select it to switch."
+                : "\(label) is already added — its sign-in was refreshed."
         } catch {
             return error.localizedDescription
         }
@@ -629,18 +696,31 @@ final class AccountManager {
     /// `nonisolated static` on purpose: this can spawn `security` and block up to
     /// 3s, so callers run it via `Task.detached` — it must never touch main-actor
     /// state. Everything it needs is passed in (Sendable values only).
+    ///
+    /// `notBefore`: when set, only credentials/identity written at or after this
+    /// instant (minus clock-skew tolerance) count — anything older is a leftover
+    /// from a previous attempt, not this login.
     private nonisolated static func captureIfReady(
         tool: AccountTool,
         stagingHome: URL,
         canonicalPaths: CanonicalCredentialPaths,
-        state: CodexPollState
+        state: CodexPollState,
+        notBefore: Date?
     ) throws -> (capture: Capture?, state: CodexPollState) {
         switch tool {
         case .claude:
-            return (try captureClaudeIfReady(stagingHome: stagingHome, canonicalPaths: canonicalPaths), state)
+            return (try captureClaudeIfReady(stagingHome: stagingHome, canonicalPaths: canonicalPaths, notBefore: notBefore), state)
         case .codex:
-            return captureCodexIfReady(stagingHome: stagingHome, state: state)
+            return captureCodexIfReady(stagingHome: stagingHome, state: state, notBefore: notBefore)
         }
+    }
+
+    /// Whether a sink written at `written` may belong to a login that started at
+    /// `notBefore` (nil ⇒ no constraint). Tolerates clock skew / second-resolution
+    /// Keychain timestamps.
+    private nonisolated static func isFresh(_ written: Date?, notBefore: Date?) -> Bool {
+        guard let notBefore, let written else { return true }
+        return written >= notBefore.addingTimeInterval(-clockSkewToleranceMs / 1000)
     }
 
     /// Claude completion requires BOTH: a suffixed Keychain blob with a parseable
@@ -648,7 +728,8 @@ final class AccountManager {
     /// `oauthAccount` whose `accountUuid` matches.
     private nonisolated static func captureClaudeIfReady(
         stagingHome: URL,
-        canonicalPaths: CanonicalCredentialPaths
+        canonicalPaths: CanonicalCredentialPaths,
+        notBefore: Date?
     ) throws -> Capture? {
         // The staging login ran with CLAUDE_CONFIG_DIR=<stagingHome>, so the
         // suffixed Keychain item is keyed off that path.
@@ -658,6 +739,13 @@ final class AccountManager {
         guard let secret = try? runner.read(service: service, account: NSUserName()),
               !secret.isEmpty
         else {
+            return nil
+        }
+        // Freshness: the Keychain item must have been (re)written by THIS login.
+        if notBefore != nil,
+           let attributes = try? runner.attributes(service: service, account: NSUserName()),
+           let modified = attributes["mdat"].flatMap(SystemSecurityRunner.keychainDate(from:)),
+           !isFresh(modified, notBefore: notBefore) {
             return nil
         }
         guard let credObject = try? JSONSerialization.jsonObject(with: Data(secret.utf8)),
@@ -675,8 +763,10 @@ final class AccountManager {
             guard expiresAt > nowMs - Self.clockSkewToleranceMs else { return nil }
         }
 
-        // Second sink: <home>/.claude.json oauthAccount.
+        // Second sink: <home>/.claude.json oauthAccount — also written by THIS login.
         let identityURL = stagingHome.appendingPathComponent(".claude.json", isDirectory: false)
+        let identityModified = (try? FileManager.default.attributesOfItem(atPath: identityURL.path))?[.modificationDate] as? Date
+        guard isFresh(identityModified, notBefore: notBefore) else { return nil }
         guard let identityData = try? Data(contentsOf: identityURL),
               let identityObject = try? JSONSerialization.jsonObject(with: identityData),
               let identityDict = identityObject as? [String: Any],
@@ -716,11 +806,14 @@ final class AccountManager {
     /// uses `FileManager.default`, which is thread-safe for these path/read checks.
     private nonisolated static func captureCodexIfReady(
         stagingHome: URL,
-        state: CodexPollState
+        state: CodexPollState,
+        notBefore: Date?
     ) -> (capture: Capture?, state: CodexPollState) {
         var state = state
         let authURL = stagingHome.appendingPathComponent("auth.json", isDirectory: false)
+        let authModified = (try? FileManager.default.attributesOfItem(atPath: authURL.path))?[.modificationDate] as? Date
         guard FileManager.default.fileExists(atPath: authURL.path),
+              isFresh(authModified, notBefore: notBefore),
               let data = try? Data(contentsOf: authURL),
               let object = try? JSONSerialization.jsonObject(with: data),
               let dict = object as? [String: Any],
@@ -765,14 +858,16 @@ final class AccountManager {
     }
 
     /// Persist a capture: write to the vault keyed by the stable identity, then
-    /// upsert (dedupe) into the profile store.
+    /// upsert (dedupe) into the profile store. `isNew` is false when the capture
+    /// matched an account that was already in the list (updated in place).
     private func persistCapture(
         tool: AccountTool,
         name: String,
         slug: String,
         stagingHome: URL,
         capture: Capture
-    ) throws -> AccountProfile {
+    ) throws -> (profile: AccountProfile, isNew: Bool) {
+        let countBefore = (try? store.loadProfiles().count) ?? 0
         let envelope = VaultEnvelope(
             tool: tool,
             backend: capture.backend,
@@ -798,7 +893,41 @@ final class AccountManager {
         // Key the vault by the same id the swap manager will look up.
         let accountId = CredentialSwapManager.accountId(for: profile)
         try vault.put(accountId: accountId, envelope)
-        return profile
+        let countAfter = (try? store.loadProfiles().count) ?? countBefore
+        return (profile, countAfter > countBefore)
+    }
+
+    /// Remove anything a PREVIOUS attempt left in a staging home so the capture
+    /// poll can only see this login's output: the identity file (Claude) or
+    /// `auth.json` (Codex), and the suffixed Keychain item. Best-effort.
+    private func clearStaleStaging(tool: AccountTool, stagingHome: URL) {
+        switch tool {
+        case .codex:
+            try? fileManager.removeItem(at: stagingHome.appendingPathComponent("auth.json", isDirectory: false))
+        case .claude:
+            let identity = stagingHome.appendingPathComponent(".claude.json", isDirectory: false)
+            if fileManager.fileExists(atPath: identity.path) {
+                try? fileManager.removeItem(at: identity)
+                ChewyLog.info("login: cleared stale identity file in staging home '\(stagingHome.lastPathComponent)'")
+            }
+            try? fileManager.removeItem(at: stagingHome.appendingPathComponent("backups", isDirectory: true))
+            deleteStagingKeychainItem(stagingHome: stagingHome)
+        }
+    }
+
+    /// Delete the suffixed Claude staging Keychain item. The CLI creates it via
+    /// `/usr/bin/security`, so deleting through `security` is what actually works;
+    /// `SecItemDelete` from the app is kept as a fallback.
+    private func deleteStagingKeychainItem(stagingHome: URL) {
+        let suffix = CredentialMath.keychainSuffix(forHome: stagingHome.path)
+        let service = "\(canonicalPaths.claudeKeychainService)-\(suffix)"
+        let account = NSUserName()
+        do {
+            try SystemSecurityRunner().delete(service: service, account: account)
+        } catch {
+            ChewyLog.warn("login: `security delete` of the staging Keychain item for '\(stagingHome.lastPathComponent)' failed (\(error.localizedDescription)); trying SecItemDelete")
+            try? KeychainCredentialStore.deleteGenericPassword(service: service, account: account)
+        }
     }
 
     /// Remove plaintext tokens left in the staging home after a login attempt.
@@ -814,9 +943,7 @@ final class AccountManager {
         case .claude:
             // The Claude staging login wrote a suffixed Keychain item keyed off the
             // staging path. Delete it; the credentials now live only in the vault.
-            let suffix = CredentialMath.keychainSuffix(forHome: stagingHome.path)
-            let service = "\(canonicalPaths.claudeKeychainService)-\(suffix)"
-            try? KeychainCredentialStore.deleteGenericPassword(service: service, account: NSUserName())
+            deleteStagingKeychainItem(stagingHome: stagingHome)
         }
     }
 

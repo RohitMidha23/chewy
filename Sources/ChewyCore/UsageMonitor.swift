@@ -85,16 +85,14 @@ public struct UsageSnapshot: Equatable, Sendable, Codable {
 /// Implementations MUST NOT log the access token or the response body.
 public protocol UsageFetching: Sendable {
     func fetchClaude(accessToken: String) async -> UsageSnapshot?
+    /// Codex usage for a ChatGPT-backed sign-in. `accountId` is the ChatGPT account
+    /// id from `auth.json` (`tokens.account_id`), sent as `chatgpt-account-id`.
+    func fetchCodex(accessToken: String, accountId: String) async -> UsageSnapshot?
 }
 
-// TODO: Codex usage (secondary, best-effort). Codex writes per-session rollout
-// logs under `~/.codex/sessions/**/rollout-*.jsonl`; the most recent `event_msg`
-// line with `payload.type == "token_count"` carries `payload.rate_limits`
-// (`used_percent`, `rate_limit_reached_type`) — parse that and surface it as a
-// UsageSnapshot.
-// Deliberately deferred: it requires globbing nested dated session dirs and
-// reverse-scanning JSONL (without spawning codex). Claude proactive polling is the
-// priority and is fully wired. Do NOT spawn codex processes when implementing this.
+public extension UsageFetching {
+    func fetchCodex(accessToken: String, accountId: String) async -> UsageSnapshot? { nil }
+}
 
 // MARK: - Parsing + fetching
 
@@ -105,17 +103,26 @@ public enum UsageMonitor {
         "five_hour": "5-hour",
         "seven_day": "7-day",
         "seven_day_opus": "7-day (Opus)",
+        "seven_day_sonnet": "7-day (Sonnet)",
         "seven_day_oauth_apps": "7-day (apps)"
     ]
 
-    /// Pure, defensive parser for Claude's `GET /api/oauth/usage` response.
+    /// Parser for Claude's `GET /api/oauth/usage` response.
     ///
-    /// The response shape varies; we look for any object whose values look like a
-    /// usage window (carry a `utilization`/`used`/`used_percent` number, optionally
-    /// with `resets_at`). Utilization is normalized to 0...100 whether the provider
-    /// reports a 0...1 fraction or a 0...100 percentage. Returns nil when nothing
-    /// window-shaped is found.
+    /// The current response carries a structured `limits` array —
+    /// `[{kind: "session"|"weekly_all"|"weekly_scoped"|…, percent, resets_at,
+    /// scope: {model: {display_name}}}]` — alongside the older named top-level
+    /// windows (`five_hour`, `seven_day`, `seven_day_opus`, …). We read BOTH, the
+    /// array first, deduping by display label, and ignore unknown top-level keys
+    /// (the endpoint also emits experimental feature buckets such as
+    /// `nimbus_quill` that must never drive the meter or the switcher).
     ///
+    /// Utilization values are PERCENTAGES (0…100) — the API has always reported
+    /// them that way and the CLI displays them verbatim. They are never rescaled:
+    /// an earlier "0…1 means a fraction" heuristic turned a genuine 1% into 100%
+    /// and fired spurious limit-reached switches right after a window reset.
+    ///
+    /// Returns nil when nothing window-shaped (and no extra-usage state) is found.
     /// Never logs the response body.
     public static func parseClaudeUsage(_ data: Data) -> UsageSnapshot? {
         guard
@@ -125,35 +132,36 @@ public enum UsageMonitor {
             return nil
         }
 
-        // Windows usually live at the top level keyed by name; some shapes nest them
-        // under a "usage"/"windows"/"limits" container. Search both.
+        var windows: [UsageWindow] = []
+        var seenLabels = Set<String>()
+        func add(label: String, percent: Double, resetsAt: Date?) {
+            guard seenLabels.insert(label).inserted else { return }
+            windows.append(UsageWindow(label: label, usedPercent: percent, resetsAt: resetsAt))
+        }
+
+        // 1. Structured `limits` array (current shape).
+        if let limits = root["limits"] as? [[String: Any]] {
+            for limit in limits {
+                guard let kind = limit["kind"] as? String,
+                      let percent = utilizationPercent(from: limit) else { continue }
+                add(label: limitLabel(kind: kind, limit: limit),
+                    percent: percent,
+                    resetsAt: resetDate(from: limit))
+            }
+        }
+
+        // 2. Known named windows at the top level (or under a legacy container).
         var containers: [[String: Any]] = [root]
-        for key in ["usage", "windows", "limits", "rate_limits"] {
+        for key in ["usage", "windows", "rate_limits"] {
             if let nested = root[key] as? [String: Any] {
                 containers.append(nested)
             }
         }
-
-        // These keys carry spend/overage state, not rate-limit windows — handled
-        // separately below so they don't masquerade as 0%-utilization windows.
-        let nonWindowKeys: Set<String> = ["spend", "extra_usage"]
-
-        var windows: [UsageWindow] = []
-        var seenLabels = Set<String>()
         for container in containers {
-            for (key, value) in container {
-                guard !nonWindowKeys.contains(key) else { continue }
-                guard let dict = value as? [String: Any] else { continue }
-                guard let percent = utilizationPercent(from: dict) else { continue }
-                let label = windowLabels[key] ?? prettify(key)
-                guard seenLabels.insert(label).inserted else { continue }
-                windows.append(
-                    UsageWindow(
-                        label: label,
-                        usedPercent: percent,
-                        resetsAt: resetDate(from: dict)
-                    )
-                )
+            for (key, label) in windowLabels {
+                guard let dict = container[key] as? [String: Any],
+                      let percent = utilizationPercent(from: dict) else { continue }
+                add(label: label, percent: percent, resetsAt: resetDate(from: dict))
             }
         }
 
@@ -169,6 +177,94 @@ public enum UsageMonitor {
             extraSpendThisCycle: extra.dollars,
             severity: extra.severity
         )
+    }
+
+    /// Display label for a `limits[]` entry. `session` is the 5-hour window;
+    /// `weekly_all` the plain 7-day budget; `weekly_scoped` a per-model 7-day cap
+    /// (labelled with the model's display name so it sorts with the other 7-day
+    /// windows via the "7-day" prefix). Unknown kinds fall back to their group.
+    static func limitLabel(kind: String, limit: [String: Any]) -> String {
+        switch kind {
+        case "session":
+            return "5-hour"
+        case "weekly_all":
+            return "7-day"
+        case "weekly_scoped":
+            let scope = limit["scope"] as? [String: Any]
+            let model = scope?["model"] as? [String: Any]
+            let name = (model?["display_name"] as? String) ?? (model?["id"] as? String)
+            if let name, !name.isEmpty { return "7-day (\(name))" }
+            return "7-day (scoped)"
+        default:
+            switch limit["group"] as? String {
+            case "session": return "5-hour"
+            case "weekly": return "7-day (\(prettify(kind)))"
+            default: return prettify(kind)
+            }
+        }
+    }
+
+    // MARK: Codex
+
+    /// Parser for the ChatGPT backend's Codex usage response
+    /// (`GET https://chatgpt.com/backend-api/wham/usage`, the same call the Codex CLI
+    /// makes for `/status`). Shape:
+    /// `rate_limit.primary_window` / `secondary_window` = `{used_percent,
+    /// limit_window_seconds, reset_at}`, plus `rate_limit_reached_type`, and
+    /// `credits.{has_credits, overage_limit_reached}`. Windows are labelled by their
+    /// length (18000s → "5-hour", 604800s → "7-day") so the planner's 5-hour /
+    /// weekly logic applies unchanged. Never logs the body.
+    public static func parseCodexUsage(_ data: Data) -> UsageSnapshot? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let root = object as? [String: Any],
+            let rateLimit = root["rate_limit"] as? [String: Any]
+        else {
+            return nil
+        }
+
+        var windows: [UsageWindow] = []
+        for (key, fallback) in [("primary_window", "5-hour"), ("secondary_window", "7-day")] {
+            guard let window = rateLimit[key] as? [String: Any],
+                  let percent = utilizationPercent(from: window) else { continue }
+            let seconds = (window["limit_window_seconds"] as? NSNumber)?.doubleValue
+            windows.append(
+                UsageWindow(
+                    label: codexWindowLabel(seconds: seconds, fallback: fallback),
+                    usedPercent: percent,
+                    resetsAt: resetDate(from: window)
+                )
+            )
+        }
+        guard !windows.isEmpty else { return nil }
+
+        let credits = root["credits"] as? [String: Any]
+        let hasCredits = (credits?["has_credits"] as? NSNumber)?.boolValue ?? false
+        let unlimited = (credits?["unlimited"] as? NSNumber)?.boolValue ?? false
+        let overageReached = (credits?["overage_limit_reached"] as? NSNumber)?.boolValue ?? false
+        let reachedType = (root["rate_limit_reached_type"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
+        windows.sort { $0.usedPercent > $1.usedPercent }
+        // Credits are Codex's "extra usage": with credits, a reached limit means the
+        // account is now burning credits — the same red state as Claude's overage.
+        return UsageSnapshot(
+            windows: windows,
+            extraUsageEnabled: hasCredits || unlimited,
+            extraSpendThisCycle: nil,
+            severity: overageReached ? "overage_limit_reached" : reachedType
+        )
+    }
+
+    /// "5-hour" / "7-day" style label for a Codex window length in seconds.
+    static func codexWindowLabel(seconds: Double?, fallback: String) -> String {
+        guard let seconds, seconds > 0 else { return fallback }
+        if seconds.truncatingRemainder(dividingBy: 86_400) == 0 {
+            return "\(Int(seconds / 86_400))-day"
+        }
+        if seconds.truncatingRemainder(dividingBy: 3_600) == 0 {
+            return "\(Int(seconds / 3_600))-hour"
+        }
+        return "\(Int(seconds / 60))-minute"
     }
 
     /// Extract extra-usage state: `extra_usage.is_enabled` (a setting), the CUMULATIVE
@@ -197,9 +293,10 @@ public enum UsageMonitor {
         return (enabled, dollars, severity)
     }
 
-    /// Pull a utilization value out of a window dict and normalize it to 0...100.
+    /// Pull a utilization PERCENTAGE (0…100) out of a window/limit dict. Values are
+    /// clamped to 0…100 and never rescaled — see `parseClaudeUsage`.
     private static func utilizationPercent(from dict: [String: Any]) -> Double? {
-        let candidateKeys = ["utilization", "used_percent", "usedPercent", "percent", "used"]
+        let candidateKeys = ["utilization", "used_percent", "usedPercent", "percent"]
         var raw: Double?
         for key in candidateKeys {
             if let number = dict[key] as? NSNumber {
@@ -212,9 +309,7 @@ public enum UsageMonitor {
             }
         }
         guard let value = raw, value.isFinite, value >= 0 else { return nil }
-        // Normalize 0...1 fractions to a percentage; leave 0...100 values as-is.
-        let percent = value <= 1.0 ? value * 100.0 : value
-        return min(percent, 100.0)
+        return min(value, 100.0)
     }
 
     /// Parse `resets_at` (ISO-8601 string, or epoch seconds number) if present.
@@ -269,7 +364,8 @@ public enum UsageMonitor {
 // MARK: - Live fetcher
 
 /// Live `UsageFetching` backed by URLSession. Calls Claude's OAuth usage endpoint
-/// with a 10s timeout. NEVER logs the access token or the response body.
+/// and the ChatGPT backend's Codex usage endpoint with a 10s timeout. NEVER logs the
+/// access token or the response body.
 public struct LiveUsageFetcher: UsageFetching {
     private let session: URLSession
 
@@ -294,12 +390,51 @@ public struct LiveUsageFetcher: UsageFetching {
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                // Never log status detail with the body; a nil keeps the prior value.
+                // Status code only — never the body. A nil keeps the prior value.
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                ChewyLog.warn("usage fetch failed: HTTP \(code)")
                 return nil
             }
-            return UsageMonitor.parseClaudeUsage(data)
+            guard let snapshot = UsageMonitor.parseClaudeUsage(data) else {
+                ChewyLog.warn("usage fetch: HTTP \(http.statusCode) but no usage windows recognised (\(data.count) bytes)")
+                return nil
+            }
+            return snapshot
         } catch {
-            // Swallow — the caller keeps the prior snapshot. Never log the error body.
+            // Swallow — the caller keeps the prior snapshot. Log the error class only.
+            ChewyLog.warn("usage fetch error: \((error as NSError).domain) \((error as NSError).code)")
+            return nil
+        }
+    }
+
+    public func fetchCodex(accessToken: String, accountId: String) async -> UsageSnapshot? {
+        guard !accessToken.isEmpty, !accountId.isEmpty,
+              let url = URL(string: "https://chatgpt.com/backend-api/wham/usage") else {
+            return nil
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(accountId, forHTTPHeaderField: "chatgpt-account-id")
+        request.setValue("codex_cli_rs/0.154.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                ChewyLog.warn("codex usage fetch failed: HTTP \(code)")
+                return nil
+            }
+            guard let snapshot = UsageMonitor.parseCodexUsage(data) else {
+                ChewyLog.warn("codex usage fetch: HTTP \(http.statusCode) but no rate_limit windows recognised (\(data.count) bytes)")
+                return nil
+            }
+            return snapshot
+        } catch {
+            ChewyLog.warn("codex usage fetch error: \((error as NSError).domain) \((error as NSError).code)")
             return nil
         }
     }

@@ -126,6 +126,39 @@ public struct SystemSecurityRunner: SecurityRunner {
         return Self.parseAttributes(result.standardError)
     }
 
+    /// Delete the generic-password item for (service, account). Items the Claude
+    /// CLI creates through `/usr/bin/security` are reliably deletable this way,
+    /// whereas `SecItemDelete` from the app silently leaves them behind — and a
+    /// stale staging item is exactly what let a re-login capture the PREVIOUS
+    /// account's token. A missing item is not an error.
+    public func delete(service: String, account: String) throws {
+        let result = try runSecurity([
+            "delete-generic-password", "-s", service, "-a", account
+        ])
+        if result.exitCode == 44 { return }
+        guard result.exitCode == 0 else {
+            throw ChewyError.keychainFailure(OSStatus(result.exitCode))
+        }
+    }
+
+    /// Parse the `"20260921083026Z"` form `security -g` prints for `cdat`/`mdat`.
+    public static func keychainDate(from raw: String) -> Date? {
+        // `security` renders the trailing NUL as a literal `\000`; take the leading
+        // 14-digit run and ignore whatever follows the `Z`.
+        let trimmed = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+        let digits = String(trimmed.prefix { $0.isNumber })
+        guard digits.count == 14, trimmed.dropFirst(14).first == "Z" else { return nil }
+        var components = DateComponents()
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = Int(digits.prefix(4))
+        components.month = Int(digits.dropFirst(4).prefix(2))
+        components.day = Int(digits.dropFirst(6).prefix(2))
+        components.hour = Int(digits.dropFirst(8).prefix(2))
+        components.minute = Int(digits.dropFirst(10).prefix(2))
+        components.second = Int(digits.dropFirst(12).prefix(2))
+        return Calendar(identifier: .gregorian).date(from: components)
+    }
+
     // MARK: Process plumbing
 
     private struct SecurityResult {
@@ -227,13 +260,25 @@ public struct SystemSecurityRunner: SecurityRunner {
     }
 
     /// Parse the non-secret `key: "value"` / `key=<...>` lines `security -g` emits.
-    static func parseAttributes(_ raw: String) -> [String: String] {
+    /// `<timedate>` attributes (`cdat`, `mdat`) are exposed as their trailing
+    /// `"20260921083026Z"` literal, for `keychainDate(from:)`.
+    public static func parseAttributes(_ raw: String) -> [String: String] {
         var attributes: [String: String] = [:]
         for line in raw.split(separator: "\n") {
             let text = line.trimmingCharacters(in: .whitespaces)
-            if let range = text.range(of: "=\"") {
-                let key = String(text[..<range.lowerBound])
+            if let tagRange = text.range(of: "<timedate>="),
+               let lastQuote = text.lastIndex(of: "\""),
+               let openQuote = text[..<lastQuote].lastIndex(of: "\"") {
+                let key = String(text[..<tagRange.lowerBound])
                     .trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+                attributes[key] = String(text[text.index(after: openQuote)..<lastQuote])
+                continue
+            }
+            if let range = text.range(of: "=\"") {
+                // `"svce"<blob>="…"` → key `svce` (drop the `<type>` tag and quotes).
+                var key = String(text[..<range.lowerBound])
+                if let tag = key.range(of: "<") { key = String(key[..<tag.lowerBound]) }
+                key = key.trimmingCharacters(in: CharacterSet(charactersIn: " \""))
                 var value = String(text[range.upperBound...])
                 if value.hasSuffix("\"") { value.removeLast() }
                 attributes[key] = value
@@ -537,6 +582,16 @@ public final class CredentialSwapManager {
             return (nil, nil)
         }
         return (oauth["emailAddress"] as? String, oauth["accountUuid"] as? String)
+    }
+
+    /// The identity (email + ChatGPT account id) currently in the canonical
+    /// `~/.codex/auth.json` — the account every NEW `codex` session uses.
+    public func canonicalCodexIdentity() -> (email: String?, accountId: String?) {
+        guard let data = try? Data(contentsOf: paths.codexAuthFile),
+              let identity = CredentialBlob.codexIdentity(fromAuthJSON: data) else {
+            return (nil, nil)
+        }
+        return (identity.email, identity.accountId)
     }
 
     /// Rewrite ONLY the `oauthAccount` key of `~/.claude.json`, preserving every

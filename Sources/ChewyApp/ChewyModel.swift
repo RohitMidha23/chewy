@@ -32,10 +32,13 @@ final class ChewyModel: NSObject, ObservableObject {
     /// The most recent switch message, if any. Published so the UI can animate
     /// (mascot hop, footer glyph) when a switch lands.
     @Published private(set) var lastSwitchMessage: String?
-    private var lastAutoSwitchAt: Date?
+    private var lastAutoSwitchAt: [AccountTool: Date] = [:]
     /// Episode throttle for the no-viable-account message, keyed by the verified
-    /// canonical accountUuid — re-arms when the active recovers (.stay) or identity changes.
-    private var noViableEpisodeKey: String?
+    /// canonical account id — re-arms when the active recovers (.stay) or identity changes.
+    private var noViableEpisodeKey: [AccountTool: String] = [:]
+    /// Fired when an in-island form opens (true) or closes (false) so the host panel
+    /// can take / release keyboard focus. Main-actor typed: handlers touch AppKit.
+    var onKeyboardNeeded: (@MainActor (Bool) -> Void)?
 
     private let store: AccountProfileStore
     private let codexHomes: CodexHomeManager
@@ -85,6 +88,8 @@ final class ChewyModel: NSObject, ObservableObject {
         self.homeURL = homeURL
         self.usageCacheURL = paths.appSupportDirectory
             .appendingPathComponent("usage-cache.json", isDirectory: false)
+        ChewyLog.configure(directory: paths.appSupportDirectory.appendingPathComponent("Logs", isDirectory: true))
+        ChewyLog.info("Chewy started")
         let accountManager = AccountManager(
             store: store,
             codexHomes: codexHomes,
@@ -104,6 +109,7 @@ final class ChewyModel: NSObject, ObservableObject {
 
             profiles = try store.loadProfiles()
             syncActiveProfiles()
+            ChewyLog.info("loaded \(profiles.count) profile(s): " + profiles.map { "\($0.tool.rawValue)/\($0.slug)=\($0.emailAddress ?? "?")" }.joined(separator: ", "))
             // Seed the usage picture from the persisted cache (pruned to the 5-hour
             // horizon) so the first auto-switch after a relaunch picks with memory.
             let cached = UsageCache.load(from: usageCacheURL)
@@ -154,9 +160,41 @@ final class ChewyModel: NSObject, ObservableObject {
     /// Set when an add-account poll times out; drives the menu's finish action.
     @Published private(set) var pendingLogin: PendingLogin?
 
+    /// An "Add account" form in progress, rendered inside the island (never a
+    /// system alert — a non-activating menu-bar app can't type into one).
+    struct AddAccountDraft: Equatable {
+        let tool: AccountTool
+    }
+
+    @Published private(set) var addAccountDraft: AddAccountDraft?
+
     private func addAccount(tool: AccountTool, name: String?) {
-        let resolved = name ?? promptForName(tool: tool)
-        guard let resolved else { return }
+        guard let name else {
+            // Open the in-island form; `confirmAddAccount` finishes the job.
+            pendingRemoval = nil
+            addAccountDraft = AddAccountDraft(tool: tool)
+            noteInteraction()
+            onKeyboardNeeded?(true)
+            return
+        }
+        startAddAccount(tool: tool, name: name)
+    }
+
+    /// Submit the in-island Add form.
+    func confirmAddAccount(name: String) {
+        guard let draft = addAccountDraft else { return }
+        addAccountDraft = nil
+        onKeyboardNeeded?(false)
+        startAddAccount(tool: draft.tool, name: name)
+    }
+
+    func cancelAddAccount() {
+        addAccountDraft = nil
+        onKeyboardNeeded?(false)
+        noteInteraction()
+    }
+
+    private func startAddAccount(tool: AccountTool, name resolved: String) {
         // Mirror AccountManager's name/slug derivation BEFORE the login starts, so a
         // timed-out attempt can be finished later against the same staging home.
         let trimmed = resolved.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -199,42 +237,31 @@ final class ChewyModel: NSObject, ObservableObject {
     /// Remove an account's saved sign-in from this Mac (vault credential + profile),
     /// after an explicit confirm. The CANONICAL credential is deliberately untouched —
     /// removing a profile never signs the user out of live CLI sessions.
-    func removeAccount(_ profile: AccountProfile) {
-        let email = accountManager.resolvedEmail(for: profile) ?? profile.name
-        let alert = NSAlert()
-        alert.messageText = "Remove \(email)?"
-        alert.informativeText = "Removes the saved sign-in from this Mac's Keychain. Your live CLI sessions are untouched."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Remove")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+    /// Awaiting the user's confirmation in the island (replaces the system alert).
+    @Published private(set) var pendingRemoval: AccountProfile?
 
+    func removeAccount(_ profile: AccountProfile) {
+        addAccountDraft = nil
+        pendingRemoval = profile
+        noteInteraction()
+    }
+
+    func cancelRemoveAccount() {
+        pendingRemoval = nil
+        noteInteraction()
+    }
+
+    func confirmRemoveAccount() {
+        guard let profile = pendingRemoval else { return }
+        pendingRemoval = nil
+        let email = accountManager.resolvedEmail(for: profile) ?? profile.name
+        ChewyLog.info("remove: \(profile.tool.rawValue)/\(profile.slug) (\(email))")
         accountManager.removeAccount(profile)
         usageByAccount.removeValue(forKey: profile.id)
         reconnectNeeded.remove(profile.id)
         profiles = (try? store.loadProfiles()) ?? profiles.filter { $0.id != profile.id }
         syncActiveProfiles()
         lastMessage = "Removed \(email)."
-    }
-
-    /// Modal name prompt; returns nil if cancelled.
-    private func promptForName(tool: AccountTool) -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Add \(tool.rawValue.capitalized) account"
-        alert.informativeText = "Name this account the way you think of it — Personal, Work, or a client. A Terminal window will open so you can sign in; Chewy captures it when you finish."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Sign in")
-        alert.addButton(withTitle: "Cancel")
-
-        let nameField = NSTextField(string: tool.rawValue.capitalized)
-        nameField.placeholderString = "Account name"
-        nameField.setFrameSize(NSSize(width: 360, height: 24))
-        alert.accessoryView = labeled("Name", field: nameField)
-
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            return nil
-        }
-        return nameField.stringValue
     }
 
     func profiles(for tool: AccountTool) -> [AccountProfile] {
@@ -264,10 +291,10 @@ final class ChewyModel: NSObject, ObservableObject {
     }
 
     func activeProfile(for tool: AccountTool) -> AccountProfile? {
-        // Source of truth for Claude: who the canonical credential actually points at,
-        // not the app's stored selection (which can drift if the user switched
-        // elsewhere or state got stale). Match by accountUuid, then email.
-        if tool == .claude, let match = resolvedActiveClaude() {
+        // Source of truth: who the canonical credential actually points at, not the
+        // app's stored selection (which can drift if the user switched elsewhere or
+        // state got stale). Match by account id, then email.
+        if let match = resolvedActive(tool) {
             return match
         }
         guard let id = activeProfileIDs[tool] else {
@@ -278,14 +305,30 @@ final class ChewyModel: NSObject, ObservableObject {
 
     /// The Claude profile the canonical credential actually points at, resolved
     /// DIRECTLY (nil ⇒ canonical matches no managed profile ⇒ not managed by us).
-    private func resolvedActiveClaude() -> AccountProfile? {
-        let identity = accountManager.canonicalClaudeIdentity()
+    private func resolvedActiveClaude() -> AccountProfile? { resolvedActive(.claude) }
+
+    /// The profile the tool's canonical credential actually points at, resolved
+    /// DIRECTLY (nil ⇒ canonical matches no managed profile ⇒ not managed by us).
+    private func resolvedActive(_ tool: AccountTool) -> AccountProfile? {
+        let identity = canonicalIdentity(for: tool)
         return ActiveAccountResolver.resolve(
-            profiles: profiles(for: .claude),
-            canonicalAccountUuid: identity.accountUuid,
+            profiles: profiles(for: tool),
+            canonicalAccountUuid: identity.accountId,
             canonicalEmail: identity.email,
             emailFor: { accountManager.resolvedEmail(for: $0) }
         )
+    }
+
+    /// Canonical identity per tool: Claude's `~/.claude.json` accountUuid/email, or
+    /// Codex's `~/.codex/auth.json` ChatGPT account id/email.
+    private func canonicalIdentity(for tool: AccountTool) -> (email: String?, accountId: String?) {
+        switch tool {
+        case .claude:
+            let identity = accountManager.canonicalClaudeIdentity()
+            return (identity.email, identity.accountUuid)
+        case .codex:
+            return accountManager.canonicalCodexIdentity()
+        }
     }
 
     /// Select an account: perform the global canonical swap (NOT a launch). For the UI,
@@ -321,14 +364,12 @@ final class ChewyModel: NSObject, ObservableObject {
         // `select` returns a human status; treat a thrown error as failure. Re-read the
         // canonical identity to confirm the swap landed on this account.
         await pollUsage()
-        if profile.tool == .claude {
-            let identity = accountManager.canonicalClaudeIdentity()
-            guard let match = resolvedActiveClaude(), match.id == profile.id else {
-                return .failed(message)
-            }
-            return .switched(email: identity.email ?? accountManager.resolvedEmail(for: profile))
+        let identity = canonicalIdentity(for: profile.tool)
+        guard let match = resolvedActive(profile.tool), match.id == profile.id else {
+            ChewyLog.warn("swap: canonical \(profile.tool.rawValue) identity did not land on \(profile.slug) (\(message))")
+            return .failed(message)
         }
-        return .switched(email: accountManager.resolvedEmail(for: profile))
+        return .switched(email: identity.email ?? accountManager.resolvedEmail(for: profile))
     }
 
     /// Restore the user's original (system-default) identity through the swap path.
@@ -432,16 +473,54 @@ final class ChewyModel: NSObject, ObservableObject {
             }
         }
 
-        let activeClaudeID = activeProfile(for: .claude)?.id
+        // "Active" here means the profile the CANONICAL credential really belongs to.
+        // Never fall back to the first/selected profile: polling it with the
+        // canonical token would display some other sign-in's usage under its name.
+        let activeClaudeID = resolvedActiveClaude()?.id
         var byAccount = usageByAccount
+        var pollSummary: [String] = []
         for profile in profiles where profile.tool == .claude {
             let isActive = profile.id == activeClaudeID
-            guard let token = accountManager.usageToken(for: profile, isActive: isActive) else { continue }
+            let who = "\(profile.emailAddress ?? profile.slug)\(isActive ? "*" : "")"
+            guard let token = accountManager.usageToken(for: profile, isActive: isActive) else {
+                pollSummary.append("\(who): no usable token")
+                continue
+            }
             if let snapshot = await usageFetcher.fetchClaude(accessToken: token) {
                 byAccount[profile.id] = snapshot
                 usageFetchedAt[profile.id] = Date()
+                pollSummary.append("\(who): " + snapshot.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: " · "))
+            } else {
+                pollSummary.append("\(who): fetch failed")
             }
         }
+        if activeClaudeID == nil, profiles.contains(where: { $0.tool == .claude }) {
+            let canonical = accountManager.canonicalClaudeIdentity().email ?? "unknown"
+            pollSummary.append("canonical Claude sign-in \(canonical) is not a managed account — auto-switch idle")
+        }
+
+        // Codex: same picture from the ChatGPT backend's usage endpoint.
+        let activeCodexID = resolvedActive(.codex)?.id
+        for profile in profiles where profile.tool == .codex {
+            let isActive = profile.id == activeCodexID
+            let who = "codex \(profile.emailAddress ?? profile.slug)\(isActive ? "*" : "")"
+            guard let creds = accountManager.codexUsageCredentials(for: profile, isActive: isActive) else {
+                pollSummary.append("\(who): no usable token")
+                continue
+            }
+            if let snapshot = await usageFetcher.fetchCodex(accessToken: creds.token, accountId: creds.accountId) {
+                byAccount[profile.id] = snapshot
+                usageFetchedAt[profile.id] = Date()
+                pollSummary.append("\(who): " + snapshot.windows.map { "\($0.label) \(Int($0.usedPercent.rounded()))%" }.joined(separator: " · "))
+            } else {
+                pollSummary.append("\(who): fetch failed")
+            }
+        }
+        if activeCodexID == nil, profiles.contains(where: { $0.tool == .codex }) {
+            let canonical = accountManager.canonicalCodexIdentity().email ?? "unknown"
+            pollSummary.append("canonical Codex sign-in \(canonical) is not a managed account — auto-switch idle")
+        }
+        ChewyLog.info("poll: " + (pollSummary.isEmpty ? "no accounts" : pollSummary.joined(separator: " | ")))
 
         // HEAL: if the ACTIVE account's usage is unreadable, the canonical access
         // token has usually expired (e.g. right after switching onto an idle
@@ -463,7 +542,9 @@ final class ChewyModel: NSObject, ObservableObject {
             defer { canonicalHealInFlight = false }
             lastCanonicalHealAt = Date()
             healArmedBySwap = false
-            switch await accountManager.healCanonicalClaude() {
+            let outcome = await accountManager.healCanonicalClaude()
+            ChewyLog.info("heal: active usage unreadable → `claude auth status` reported \(outcome)")
+            switch outcome {
             case .healthy:
                 // The CLI refreshed (or confirmed) the canonical — capture the
                 // rotation into its owner's vault entry and retry the read once.
@@ -548,58 +629,74 @@ final class ChewyModel: NSObject, ObservableObject {
 
     private var wasInOverage = false
 
-    /// Build the planner inputs from confirmed canonical identity + fresh usage, then act.
+    /// Build the planner inputs from confirmed canonical identity + fresh usage, then
+    /// act — independently for Claude and for Codex (each has its own canonical
+    /// credential, its own candidates and its own cooldown).
     private func evaluateAutoSwitch() {
-        let identity = accountManager.canonicalClaudeIdentity()
+        for tool in AccountTool.allCases {
+            evaluateAutoSwitch(for: tool)
+        }
+    }
+
+    private func evaluateAutoSwitch(for tool: AccountTool) {
+        let toolProfiles = profiles(for: tool)
+        guard !toolProfiles.isEmpty else { return }
+        let identity = canonicalIdentity(for: tool)
         let match = ActiveAccountResolver.resolve(
-            profiles: profiles(for: .claude),
-            canonicalAccountUuid: identity.accountUuid,
+            profiles: toolProfiles,
+            canonicalAccountUuid: identity.accountId,
             canonicalEmail: identity.email,
             emailFor: { accountManager.resolvedEmail(for: $0) }
         )
         let inputs = AutoSwitchInputs.build(
             activeMatch: match,
-            claudeProfiles: profiles(for: .claude),
+            claudeProfiles: toolProfiles,
             usageByAccount: usageByAccount,
             excluding: reconnectNeeded, // never switch onto a known-dead sign-in
-            lastSwitchAt: lastAutoSwitchAt,
+            lastSwitchAt: lastAutoSwitchAt[tool],
             now: Date()
         )
-        switch AutoSwitchPlanner.plan(inputs) {
+        let decision = AutoSwitchPlanner.plan(inputs)
+        switch decision {
         case .switchTo(let id, let reason):
-            guard autoSwitchEnabled, let target = profiles.first(where: { $0.id == id }) else { return }
+            guard autoSwitchEnabled, let target = profiles.first(where: { $0.id == id }) else {
+                ChewyLog.info("auto-switch(\(tool.rawValue)): planner chose \(id) (\(reason)) but auto-switch is \(autoSwitchEnabled ? "on; target missing" : "off")")
+                return
+            }
+            ChewyLog.info("auto-switch(\(tool.rawValue)): → \(target.emailAddress ?? target.slug) — \(reason)")
             // Arm the cooldown synchronously: pollUsage() fires every 60s and the swap is
             // async, so without this a second poll mid-swap could spawn a duplicate switch.
-            lastAutoSwitchAt = Date()
+            lastAutoSwitchAt[tool] = Date()
             Task { @MainActor in
                 switch await self.selectOutcome(target) {
                 case .switched(let email):
-                    self.lastSwitchMessage = "New sessions now use \(email ?? target.name) — \(reason)"
+                    self.lastSwitchMessage = "New \(tool.rawValue.capitalized) sessions now use \(email ?? target.name) — \(reason)"
                     self.lastMessage = self.lastSwitchMessage ?? self.lastMessage
                     self.onAutoSwitch?()
                 case .failed:
                     // The swap didn't take (read-back mismatch / dead token) — release the
                     // cooldown so the next poll can retry, and prompt the user to reconnect
                     // the target. Never announce success.
-                    self.lastAutoSwitchAt = nil
+                    self.lastAutoSwitchAt[tool] = nil
                     self.reconnectNeeded.insert(target.id)
                     let email = self.accountManager.resolvedEmail(for: target) ?? target.name
                     self.surfaceReconnect("Couldn't switch — Reconnect \(email)")
                 }
             }
         case .noViableAccount(let allKnownMaxed):
-            // Throttle once per episode, keyed by the verified canonical accountUuid.
-            let key = identity.accountUuid ?? identity.email ?? "unknown"
-            guard noViableEpisodeKey != key else { return }
-            noViableEpisodeKey = key
+            // Throttle once per episode, keyed by the verified canonical account id.
+            let key = identity.accountId ?? identity.email ?? "unknown"
+            guard noViableEpisodeKey[tool] != key else { return }
+            noViableEpisodeKey[tool] = key
+            ChewyLog.warn("auto-switch(\(tool.rawValue)): active account is walled but no viable target (allKnownMaxed=\(allKnownMaxed))")
             lastSwitchMessage = allKnownMaxed
-                ? "All accounts are at their usage limits"
-                : "No other account to switch to — add one"
+                ? "All \(tool.rawValue.capitalized) accounts are at their usage limits"
+                : "No other \(tool.rawValue.capitalized) account to switch to — add one"
             lastMessage = lastSwitchMessage ?? lastMessage
             onAutoSwitch?()
         case .stay:
             // Active recovered (or is fine) — re-arm the no-viable episode.
-            noViableEpisodeKey = nil
+            noViableEpisodeKey[tool] = nil
         }
     }
 
@@ -661,7 +758,13 @@ final class ChewyModel: NSObject, ObservableObject {
         idleTimer?.invalidate()
         let timer = Timer.scheduledTimer(withTimeInterval: idleSeconds, repeats: false) { [weak self] _ in
             Task { @MainActor in
-                self?.isMinimized = true
+                guard let self else { return }
+                // A form in progress (Add / Remove account) keeps the island open.
+                if self.addAccountDraft != nil || self.pendingRemoval != nil {
+                    self.restartIdleTimer()
+                    return
+                }
+                self.isMinimized = true
             }
         }
         timer.tolerance = 0.5
@@ -688,18 +791,4 @@ final class ChewyModel: NSObject, ObservableObject {
         }
     }
 
-    private func labeled(_ label: String, field: NSView) -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.spacing = 3
-
-        let text = NSTextField(labelWithString: label)
-        text.font = .systemFont(ofSize: 11, weight: .medium)
-        text.textColor = .secondaryLabelColor
-
-        field.setFrameSize(NSSize(width: 360, height: 24))
-        stack.addArrangedSubview(text)
-        stack.addArrangedSubview(field)
-        return stack
-    }
 }

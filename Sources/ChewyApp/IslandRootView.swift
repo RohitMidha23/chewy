@@ -63,6 +63,16 @@ struct IslandRootView: View {
                 reduceMotion: reduceMotion
             )
 
+            // In-island forms replace the old system alerts (which a non-activating
+            // menu-bar panel could never type into).
+            if let draft = model.addAccountDraft {
+                AddAccountCard(model: model, tool: draft.tool)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            } else if let pending = model.pendingRemoval {
+                RemoveAccountCard(model: model, profile: pending)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             FooterBar(
                 switchMessage: switchMessage,
                 message: statusMessage,
@@ -76,6 +86,8 @@ struct IslandRootView: View {
         .fixedSize(horizontal: false, vertical: true)
         .background(IslandShell(attentionLevel: attentionLevel, reduceMotion: reduceMotion))
         .padding(IslandTheme.outerPadding)
+        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: model.addAccountDraft)
+        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: model.pendingRemoval?.id)
     }
 
     /// The strongest attention level currently in play, driven purely by proactive
@@ -465,6 +477,11 @@ private struct HeaderBar: View {
     private var statusSubtitle: String {
         guard profileCount > 0 else { return "Add a Claude or Codex account" }
         guard let active = model.activeProfile(for: .claude) else {
+            // The live CLI sign-in belongs to nobody in the list: say so, because
+            // auto-switch can only act on accounts Chewy manages.
+            if let email = model.accountManager.canonicalClaudeIdentity().email, !email.isEmpty {
+                return "Signed in as \(email) — not added to Chewy"
+            }
             return "Watching \(profileCount) account\(profileCount == 1 ? "" : "s")"
         }
         let email = model.accountManager.resolvedEmail(for: active) ?? active.name
@@ -639,17 +656,16 @@ private struct AccountMenu: View {
     }
 
     /// Compact per-account usage for the dropdown: an over-limit flag when actually
-    /// in overage, else the hottest window % + reset countdown. A Claude account
-    /// whose usage we can't read (its stored token expired — idle >8h) is labeled
+    /// in overage, else the hottest window % + reset countdown. An account whose
+    /// usage we can't read (its stored token expired while idle) is labeled
     /// honestly: idle that long means its 5-hour window has fully reset, and we
-    /// never refresh idle tokens ourselves (single-use refresh tokens). Codex has
-    /// no usage source wired, so its rows stay bare.
+    /// never refresh idle tokens ourselves. Codex usage comes from the ChatGPT
+    /// backend's usage endpoint, Claude's from Anthropic's.
     private func usageSuffix(for profile: AccountProfile) -> String? {
         guard let snapshot = model.usageByAccount[profile.id] else {
             // Only signed-in Claude accounts get the "likely fresh" read — an
             // un-signed stub has no credential and its row already says so.
-            guard profile.tool == .claude,
-                  model.accountManager.hasVaultCredential(for: profile) else { return nil }
+            guard model.accountManager.hasVaultCredential(for: profile) else { return nil }
             // For an IDLE account unknown is expected (its token ages out; idle >8h
             // means the 5-hour window reset). For the ACTIVE account it's a tell —
             // the canonical token isn't working — so say that, not "fresh".
@@ -673,6 +689,139 @@ private struct AccountMenu: View {
             return "\(pctText) · resets \(resets)"
         }
         return pctText
+    }
+}
+
+// MARK: - In-island forms
+
+/// Shared chrome for the Add / Remove cards: a slightly lighter inset panel that
+/// reads as part of the island, not a dialog on top of it.
+private struct IslandCard<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(title)
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.92))
+            content
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(.white.opacity(0.06))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1))
+        )
+    }
+}
+
+private struct IslandButton: View {
+    enum Style { case primary, secondary, destructive }
+    let title: String
+    var style: Style = .secondary
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(style == .secondary ? .white.opacity(0.85) : .white)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 6)
+                .background(background, in: Capsule())
+                .overlay(Capsule().stroke(.white.opacity(0.18), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+    }
+
+    private var background: Color {
+        switch style {
+        case .primary: return IslandTheme.accent
+        case .destructive: return IslandTheme.critical
+        case .secondary: return .white.opacity(0.10)
+        }
+    }
+}
+
+/// Name a new account, then hand off to the Terminal sign-in. Focus lands in the
+/// field as soon as the host panel becomes key.
+private struct AddAccountCard: View {
+    @ObservedObject var model: ChewyModel
+    let tool: AccountTool
+    @State private var name: String = ""
+    @FocusState private var focused: Bool
+
+    private var toolName: String { tool.rawValue.capitalized }
+    private var hint: String {
+        tool == .claude
+            ? "Your browser signs in with the claude.ai account it is currently logged into — switch accounts (or use a private window) first to add a different one."
+            : "Your browser signs in with the ChatGPT account it is currently logged into — switch accounts (or use a private window) first to add a different one."
+    }
+
+    var body: some View {
+        IslandCard(title: "Add \(toolName) account") {
+            TextField("Account name — Personal, Work, a client…", text: $name)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12.5))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(.black.opacity(0.32)))
+                .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(focused ? IslandTheme.accent.opacity(0.8) : .white.opacity(0.14), lineWidth: 1))
+                .focused($focused)
+                .onSubmit(submit)
+            Text("A Terminal window opens so you can sign in; Chewy captures the account when you finish. " + hint)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.62))
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                IslandButton(title: "Cancel") { model.cancelAddAccount() }
+                    .keyboardShortcut(.cancelAction)
+                IslandButton(title: "Sign in", style: .primary, action: submit)
+            }
+        }
+        .onAppear {
+            name = toolName
+            // The panel takes key status a beat after the card appears.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                focused = true
+            }
+        }
+        .onHover { _ in model.noteInteraction() }
+    }
+
+    private func submit() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.confirmAddAccount(name: trimmed.isEmpty ? toolName : trimmed)
+    }
+}
+
+/// Confirm removing a saved sign-in — same wording as the old alert, in place.
+private struct RemoveAccountCard: View {
+    @ObservedObject var model: ChewyModel
+    let profile: AccountProfile
+
+    var body: some View {
+        let email = model.accountManager.resolvedEmail(for: profile) ?? profile.name
+        IslandCard(title: "Remove \(email)?") {
+            Text("Removes the saved sign-in from this Mac's Keychain. Your live CLI sessions are untouched.")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.62))
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                IslandButton(title: "Cancel") { model.cancelRemoveAccount() }
+                    .keyboardShortcut(.cancelAction)
+                IslandButton(title: "Remove", style: .destructive) { model.confirmRemoveAccount() }
+            }
+        }
+        .onHover { _ in model.noteInteraction() }
     }
 }
 

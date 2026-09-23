@@ -9,7 +9,7 @@
 - **Usage meter in the menu bar** — the mascot shows the active account's 5-hour usage and turns warning/critical before you'd find out the hard way.
 - **Auto-switch** — fires on the 5-hour wall (>95%), a drained weekly budget, or live overage. Picks the best alternative with simulation-tuned scoring (most headroom, reset-aware, weekly-budget tiebreaks); when *every* account is maxed it rides whichever resets soonest. The policy is regression-guarded by a discrete-event simulator in the test suite.
 - **Self-healing sign-ins** — token rotations and manual `/login`s are captured continuously; after every switch the landing account's token is refreshed by delegating to the official CLI (never by touching idle accounts' single-use refresh tokens). A genuinely dead sign-in is escaped automatically and quarantined until you reconnect it.
-- **Per-account usage in the dropdown** — every signed-in account with its current 5-hour percentage, a reset countdown, and a marked recommendation.
+- **Per-account usage in the dropdown** — every signed-in Claude and Codex account with its current 5-hour percentage, a reset countdown, and a marked recommendation. Codex accounts auto-switch on the same policy.
 - **Island notifications** — a liquid-glass overlay announces switches and warnings, then fully disappears after ~10 seconds without interaction. No Dock icon, no permanent pill, no clutter.
 - **Table stakes** — launch at login, remove account, reconnect in place (no duplicate accounts).
 
@@ -26,7 +26,7 @@ Every write is verified and rolled back on mismatch, captures are identity-attri
 
 ## Privacy
 
-Everything stays on your machine. Tokens live in your login Keychain; account metadata lives in `~/Library/Application Support/Chewy` with owner-only permissions. There is no telemetry and no server. The app never calls any endpoint except Anthropic's usage API, over HTTPS, authenticated with your own token — that's how it knows how full your 5-hour window is.
+Everything stays on your machine. Tokens live in your login Keychain; account metadata lives in `~/Library/Application Support/Chewy` with owner-only permissions. There is no telemetry and no server. The app calls exactly two endpoints, over HTTPS and authenticated with your own tokens: Anthropic's usage API for Claude accounts and the ChatGPT backend's Codex usage API (the same call `codex` makes for `/status`) for Codex accounts — that's how it knows how full each 5-hour window is.
 
 ## Install
 
@@ -57,6 +57,12 @@ Then move `dist/Chewy.app` to `/Applications` and **right-click → Open** the f
 
 **Why does macOS show a Keychain prompt on first run?**
 Chewy reads and writes the same Keychain item Claude Code uses. Click "Always Allow" so you aren't re-prompted. Because the build is ad-hoc signed, a rebuild looks like a new app to the Keychain and may prompt again — just click "Always Allow" once more.
+
+**Where are the logs?**
+Right-click the menu-bar icon → *Show Log File*. Chewy writes `~/Library/Application Support/Chewy/Logs/chewy.log` (usage percentages, switch decisions, sign-in captures, HTTP status codes — never tokens). The same lines go to the unified log under subsystem `io.github.rohitmidha23.chewy`.
+
+**Adding a second account captured the same account again — why?**
+`claude auth login` opens claude.ai in your browser, which signs in with whatever account it is *currently* logged into. Switch accounts on claude.ai (or use a private window) before clicking "Add Claude account". Chewy now tells you when a sign-in landed on an account that is already in the list instead of silently merging it.
 
 **Does switching log me out of anything?**
 No. Switching only changes which account **new** sessions pick up. Sessions that are already running keep their credentials and keep working.

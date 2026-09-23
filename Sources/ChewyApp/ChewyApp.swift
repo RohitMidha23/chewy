@@ -144,6 +144,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launch.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(launch)
 
+        let log = NSMenuItem(title: "Show Log File", action: #selector(showLogFile), keyEquivalent: "")
+        log.target = self
+        menu.addItem(log)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Chewy",
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -163,6 +167,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Register/unregister the app as a login item. Only works from the installed
     /// .app bundle — from `swift run` the call throws, and we surface a friendly note.
+    /// Reveal the diagnostics log (percentages, decisions, HTTP statuses — never tokens).
+    @objc private func showLogFile() {
+        guard let url = ChewyLog.currentFileURL else { return }
+        if !FileManager.default.fileExists(atPath: url.path) {
+            ChewyLog.info("log opened by user")
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
     @objc private func toggleLaunchAtLogin() {
         let service = SMAppService.mainApp
         do {
